@@ -189,6 +189,26 @@ impl WriteLine for BlockItem {
     }
 }
 
+impl WriteString for TypeSpecifier {
+    fn write_string(&self) -> String {
+        match self {
+            Self::Void => String::from("void"),
+            Self::Char => String::from("char"),
+            Self::Short => String::from("short"),
+            Self::Int => String::from("int"),
+            Self::Long => String::from("long"),
+            Self::Float => String::from("float"),
+            Self::Double => String::from("double"),
+            Self::Signed => String::from("signed"),
+            Self::Unsigned => String::from("unsigned"),
+            Self::Bool => String::from("_Bool"),
+            Self::Struct(struct_type) => struct_type.write_string(),
+            Self::TypedefName(type_name) => type_name.write_string(),
+            _ => panic!("WriteString::TypeSpecifier"),
+        }
+    }
+}
+
 impl WriteString for (Vec<Node<DeclarationSpecifier>>, Node<Declarator>) {
     fn write_string(&self) -> String {
         format!(
@@ -247,26 +267,6 @@ impl WriteString for StorageClassSpecifier {
         match self {
             Self::Typedef => String::from("typedef"),
             _ => panic!("WriteString::StorageClassSpecifier"),
-        }
-    }
-}
-
-impl WriteString for TypeSpecifier {
-    fn write_string(&self) -> String {
-        match self {
-            Self::Void => String::from("void"),
-            Self::Char => String::from("char"),
-            Self::Short => String::from("short"),
-            Self::Int => String::from("int"),
-            Self::Long => String::from("long"),
-            Self::Float => String::from("float"),
-            Self::Double => String::from("double"),
-            Self::Signed => String::from("signed"),
-            Self::Unsigned => String::from("unsigned"),
-            Self::Bool => String::from("_Bool"),
-            Self::Struct(struct_type) => struct_type.write_string(),
-            Self::TypedefName(type_name) => type_name.write_string(),
-            _ => panic!("WriteString::TypeSpecifier"),
         }
     }
 }
@@ -545,18 +545,18 @@ impl WriteString for BinaryOperatorExpression {
             _ => match self.operator.node {
                 BinaryOperator::Index
                 | BinaryOperator::Assign
-                | BinaryOperator::AssignMultiply
-                | BinaryOperator::AssignDivide
-                | BinaryOperator::AssignModulo
+                // | BinaryOperator::AssignMultiply
+                // | BinaryOperator::AssignDivide
+                // | BinaryOperator::AssignModulo
                 // | BinaryOperator::AssignPlus
                 // | BinaryOperator::AssignMinus
-                | BinaryOperator::AssignShiftLeft
-                | BinaryOperator::AssignShiftRight
+                // | BinaryOperator::AssignShiftLeft
+                // | BinaryOperator::AssignShiftRight
                 | BinaryOperator::AssignBitwiseAnd
                 | BinaryOperator::AssignBitwiseOr
                 | BinaryOperator::AssignBitwiseXor => {
                     format!(
-                        "{} {} {}",
+                        "{} {} ({})",
                         self.lhs.node.write_string(),
                         self.operator.node.write_string(),
                         self.rhs.node.write_string()
@@ -633,10 +633,10 @@ impl WriteString for Declarator {
             .filter(|d| matches!(d.node, DerivedDeclarator::Pointer(_)))
             .count();
 
-        let has_kr_function = self
-            .derived
-            .iter()
-            .any(|d| matches!(d.node, DerivedDeclarator::KRFunction(_)));
+        // let has_kr_function = self
+        //     .derived
+        //     .iter()
+        //     .any(|d| matches!(d.node, DerivedDeclarator::KRFunction(_)));
 
         let derived = self
             .derived
@@ -645,10 +645,7 @@ impl WriteString for Declarator {
             .collect::<Vec<_>>()
             .join("");
 
-        if pointer_count > 0 && has_kr_function {
-            let pointers = "*".repeat(pointer_count);
-            format!("({}{}{})", pointers, kind, derived)
-        } else if pointer_count > 0 {
+        if pointer_count > 0 {
             let pointers = "*".repeat(pointer_count);
             format!("{}{}{}", pointers, kind, derived)
         } else {
@@ -662,7 +659,7 @@ impl WriteString for DeclaratorKind {
         match self {
             Self::Abstract => String::from(""),
             Self::Identifier(identifier) => identifier.write_string(),
-            Self::Declarator(decl) => decl.write_string(),
+            Self::Declarator(decl) => format!("({})", decl.write_string()),
         }
     }
 }
@@ -721,14 +718,14 @@ impl WriteString for UnaryOperatorExpression {
     fn write_string(&self) -> String {
         let operand = self.operand.as_ref().write_string();
         match self.operator.node {
-            UnaryOperator::PostIncrement => format!("{}++", operand),
-            UnaryOperator::PostDecrement => format!("{}--", operand),
-            UnaryOperator::PreIncrement => format!("++{}", operand),
-            UnaryOperator::PreDecrement => format!("--{}", operand),
-            UnaryOperator::Address => format!("&{}", operand),
-            UnaryOperator::Indirection => format!("*{}", operand),
-            UnaryOperator::Plus => format!("+{}", operand),
-            UnaryOperator::Minus => format!("-{}", operand),
+            UnaryOperator::PostIncrement => format!("({})++", operand),
+            UnaryOperator::PostDecrement => format!("({})--", operand),
+            UnaryOperator::PreIncrement => format!("++({})", operand),
+            UnaryOperator::PreDecrement => format!("--({})", operand),
+            UnaryOperator::Address => format!("&({})", operand),
+            UnaryOperator::Indirection => format!("*({})", operand),
+            UnaryOperator::Plus => format!("+({})", operand),
+            UnaryOperator::Minus => format!("-({})", operand),
             UnaryOperator::Complement => format!("~({})", operand),
             UnaryOperator::Negate => format!("!({})", operand),
         }
