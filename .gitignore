@@ -4,3 +4,6 @@ rustfmt.toml
 **/*.rs.bk
 csmith
 .DS_Store
+
+.vscode
+.cursor
