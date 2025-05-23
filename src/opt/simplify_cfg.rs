@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 use itertools::izip;
 use lang_c::visit;
@@ -57,110 +57,100 @@ fn make_cfg(fdef: &FunctionDefinition) -> HashMap<BlockId, Vec<JumpArg>> {
         .collect()
 }
 
-// pub fn reverse_cfg(
-//     cfg: &HashMap<BlockId, Vec<JumpArg>>,
-// ) -> HashMap<BlockId, Vec<(BlockId, JumpArg)>> {
-//     let mut result = HashMap::new();
-//     for (bid, jumps) in cfg {
-//         for jump in jumps {
-//             result
-//                 .entry(jump.bid)
-//                 .or_insert_with(Vec::new)
-//                 .push((*bid, jump.clone()));
-//         }
-//     }
-//     result
-// }
+fn walk_function_operands<F>(fdef: &mut FunctionDefinition, mut f: F)
+where
+    F: FnMut(&mut Operand),
+{
+    for (_, block) in fdef.blocks.iter_mut() {
+        for instruction in block.instructions.iter_mut() {
+            walk_instruction_operands(instruction.deref_mut(), &mut f);
+        }
 
-// fn replace_operand(operand: &mut Operand, replaces: &HashMap<RegisterId, Operand>) {
-//     if let Operand::Register { rid, .. } = operand {
-//         if let Some(replacement) = replaces.get(rid) {
-//             *operand = replacement.clone();
-//         }
-//     }
-// }
+        walk_block_exit_operands(&mut block.exit, &mut f);
+    }
+}
 
-// fn replace_operand_in_instruction(
-//     instruction: &mut Named<Instruction>,
-//     replaces: &HashMap<RegisterId, Operand>,
-// ) {
-//     match &mut **instruction {
-//         Instruction::Value { value } => {
-//             replace_operand(value, replaces);
-//         }
-//         Instruction::BinOp { lhs, rhs, .. } => {
-//             replace_operand(lhs, replaces);
-//             replace_operand(rhs, replaces);
-//         }
-//         Instruction::UnaryOp { operand, .. } => {
-//             replace_operand(operand, replaces);
-//         }
-//         Instruction::Store { ptr, value } => {
-//             replace_operand(ptr, replaces);
-//             replace_operand(value, replaces);
-//         }
-//         Instruction::Load { ptr } => {
-//             replace_operand(ptr, replaces);
-//         }
-//         Instruction::Call { callee, args, .. } => {
-//             replace_operand(callee, replaces);
-//             for arg in args {
-//                 replace_operand(arg, replaces);
-//             }
-//         }
-//         Instruction::TypeCast { value, .. } => {
-//             replace_operand(value, replaces);
-//         }
-//         Instruction::GetElementPtr { ptr, offset, .. } => {
-//             replace_operand(ptr, replaces);
-//             replace_operand(offset, replaces);
-//         }
-//         Instruction::Nop => {}
-//     }
-// }
+fn walk_instruction_operands<F>(instruction: &mut Instruction, f: &mut F)
+where
+    F: FnMut(&mut Operand),
+{
+    match instruction {
+        Instruction::Nop => {}
+        Instruction::Value { value } => f(value),
+        Instruction::BinOp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        Instruction::UnaryOp { operand, .. } => f(operand),
+        Instruction::Store { ptr, value } => {
+            f(ptr);
+            f(value);
+        }
+        Instruction::Load { ptr } => f(ptr),
+        Instruction::Call { callee, args, .. } => {
+            f(callee);
+            for arg in args {
+                f(arg);
+            }
+        }
+        Instruction::TypeCast { value, .. } => f(value),
+        Instruction::GetElementPtr { ptr, offset, .. } => {
+            f(ptr);
+            f(offset);
+        }
+    }
+}
 
-// /// Replace operands in a block exit
-// fn replace_operand_in_exit(exit: &mut BlockExit, replaces: &HashMap<RegisterId, Operand>) {
-//     match exit {
-//         BlockExit::Jump { arg } => {
-//             for operand in &mut arg.args {
-//                 replace_operand(operand, replaces);
-//             }
-//         }
-//         BlockExit::ConditionalJump {
-//             condition,
-//             arg_then,
-//             arg_else,
-//         } => {
-//             replace_operand(condition, replaces);
-//             for operand in &mut arg_then.args {
-//                 replace_operand(operand, replaces);
-//             }
-//             for operand in &mut arg_else.args {
-//                 replace_operand(operand, replaces);
-//             }
-//         }
-//         BlockExit::Switch {
-//             value,
-//             default,
-//             cases,
-//         } => {
-//             replace_operand(value, replaces);
-//             for operand in &mut default.args {
-//                 replace_operand(operand, replaces);
-//             }
-//             for (_, case_arg) in cases {
-//                 for operand in &mut case_arg.args {
-//                     replace_operand(operand, replaces);
-//                 }
-//             }
-//         }
-//         BlockExit::Return { value } => {
-//             replace_operand(value, replaces);
-//         }
-//         BlockExit::Unreachable => {}
-//     }
-// }
+fn walk_block_exit_operands<F>(exit: &mut BlockExit, f: &mut F)
+where
+    F: FnMut(&mut Operand),
+{
+    match exit {
+        BlockExit::Jump { arg } => {
+            for operand in &mut arg.args {
+                f(operand);
+            }
+        }
+        BlockExit::ConditionalJump {
+            condition,
+            arg_then,
+            arg_else,
+        } => {
+            f(condition);
+            for operand in &mut arg_then.args {
+                f(operand);
+            }
+            for operand in &mut arg_else.args {
+                f(operand);
+            }
+        }
+        BlockExit::Switch {
+            value,
+            default,
+            cases,
+        } => {
+            f(value);
+            for operand in &mut default.args {
+                f(operand);
+            }
+            for (_, arg) in cases {
+                for operand in &mut arg.args {
+                    f(operand);
+                }
+            }
+        }
+        BlockExit::Return { value } => f(value),
+        BlockExit::Unreachable => {}
+    }
+}
+
+fn replace_operands(operand: &mut Operand, replaces: &HashMap<RegisterId, Operand>) {
+    if let Some((rid, _)) = operand.get_register() {
+        if let Some(replacement) = replaces.get(rid) {
+            *operand = replacement.clone();
+        }
+    }
+}
 
 impl Optimize<FunctionDefinition> for SimplifyCfgConstProp {
     fn optimize(&mut self, code: &mut FunctionDefinition) -> bool {
@@ -210,40 +200,57 @@ impl Optimize<FunctionDefinition> for SimplifyCfgMerge {
             }
         }
 
-        let mut result = false;
-        for (bid_from, block_from) in code.blocks.iter_mut() {
+        let mut merge_candidates = Vec::new();
+        for (bid_from, block_from) in code.blocks.iter() {
             if let BlockExit::Jump { arg } = &block_from.exit {
                 if *bid_from != arg.bid && indegrees.get(&arg.bid) == Some(&1) {
-                    let block_to = code.blocks.remove(&arg.bid).unwrap();
-                    let bid_to = arg.bid;
-                    let args_to = arg.args.clone();
-                    let mut replaces = HashMap::new();
-
-                    for (i, (a, p)) in izip!(&args_to, block_to.phinodes.iter()).enumerate() {
-                        assert_eq!(&a.dtype(), p.deref());
-                        let from = RegisterId::arg(bid_to, i);
-                        replaces.insert(from, a.clone());
-                    }
-
-                    let len = block_from.instructions.len();
-                    for (i, instr) in block_to.instructions.into_iter().enumerate() {
-                        let dtype = instr.dtype();
-                        block_from.instructions.push(instr);
-                        let from = RegisterId::temp(arg.bid, i);
-                        let to =
-                            Operand::register(RegisterId::temp(*bid_from, len + i), dtype.clone());
-                        replaces.insert(from, to);
-                    }
-
-                    block_from.exit = block_to.exit;
-
-                    let _unused = code.walk(|operand| replace_operands(operand, &replaces));
-                    result = true;
+                    merge_candidates.push((*bid_from, arg.bid, arg.args.clone()));
                 }
             }
         }
 
-        result
+        if merge_candidates.is_empty() {
+            return false;
+        }
+
+        let mut all_replaces = HashMap::new();
+
+        for (bid_from, bid_to, args_to) in merge_candidates {
+            if !code.blocks.contains_key(&bid_from) || !code.blocks.contains_key(&bid_to) {
+                continue;
+            }
+
+            let block_to = code.blocks.remove(&bid_to).unwrap();
+            let block_from = code.blocks.get_mut(&bid_from).unwrap();
+
+            let mut replaces = HashMap::new();
+
+            for (i, (a, p)) in izip!(&args_to, block_to.phinodes.iter()).enumerate() {
+                assert_eq!(&a.dtype(), p.deref());
+                let from = RegisterId::arg(bid_to, i);
+                let _unused = replaces.insert(from, a.clone());
+            }
+
+            let len = block_from.instructions.len();
+            for (i, instr) in block_to.instructions.into_iter().enumerate() {
+                let dtype = instr.dtype();
+                block_from.instructions.push(instr);
+                let from = RegisterId::temp(bid_to, i);
+                let to = Operand::register(RegisterId::temp(bid_from, len + i), dtype.clone());
+                let _unused = replaces.insert(from, to);
+            }
+
+            block_from.exit = block_to.exit;
+
+            // Collect all replacements
+            for (k, v) in replaces {
+                let _unused = all_replaces.insert(k, v);
+            }
+        }
+
+        walk_function_operands(code, |operand| replace_operands(operand, &all_replaces));
+
+        true
     }
 }
 
