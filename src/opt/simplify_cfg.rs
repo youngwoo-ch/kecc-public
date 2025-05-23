@@ -242,7 +242,6 @@ impl Optimize<FunctionDefinition> for SimplifyCfgMerge {
 
             block_from.exit = block_to.exit;
 
-            // Collect all replacements
             for (k, v) in replaces {
                 let _unused = all_replaces.insert(k, v);
             }
