@@ -400,6 +400,21 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
         let mut inpromotable = HashSet::new();
         let mut stores = HashMap::<usize, Vec<BlockId>>::new();
 
+        for (aid, alloc) in code.allocations.iter().enumerate() {
+            match alloc.deref() {
+                Dtype::Unit { .. }
+                | Dtype::Int { .. }
+                | Dtype::Float { .. }
+                | Dtype::Pointer { .. } => {}
+                Dtype::Array { .. }
+                | Dtype::Struct { .. }
+                | Dtype::Function { .. }
+                | Dtype::Typedef { .. } => {
+                    let _unused = inpromotable.insert(aid);
+                }
+            }
+        }
+
         for (bid, block) in &code.blocks {
             for instr in &block.instructions {
                 match instr.deref() {
@@ -491,7 +506,6 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                                 continue;
                             }
 
-                            // Check if we already have a value for this allocation in this block
                             if let Some(var) = end_values.get(&(*aid, *bid)) {
                                 let result =
                                     replaces.insert(RegisterId::temp(*bid, i), var.clone());
@@ -499,10 +513,8 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                                 continue;
                             }
 
-                            // Check if the current block will have a phi node for this allocation
                             let bid_join = join_table.lookup(*aid, *bid);
                             if bid_join == *bid && joins_set.contains(&(*aid, *bid)) {
-                                // This block will have a phi node for this allocation
                                 let var = OperandVar::Phi((*aid, *bid));
                                 let _unused = end_values.insert((*aid, *bid), var.clone());
                                 let result = replaces.insert(RegisterId::temp(*bid, i), var);
@@ -510,23 +522,18 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                                 continue;
                             }
 
-                            // Try to find the value at the join point
                             let var = if let Some(val) = end_values.get(&(*aid, bid_join)) {
                                 val.clone()
                             } else {
-                                // If we can't find a value at the join point, try to find it
-                                // by walking up the dominator tree from the current block
                                 let mut found = None;
                                 let mut current = *bid;
 
-                                // First check if the immediate dominator has a phi node for this allocation
                                 if let Some(idom) = domtree.idom(current) {
                                     if joins_set.contains(&(*aid, idom)) {
                                         found = Some(OperandVar::Phi((*aid, idom)));
                                     }
                                 }
 
-                                // If not found, continue walking up the dominator tree
                                 if found.is_none() {
                                     while let Some(idom) = domtree.idom(current) {
                                         if let Some(val) = end_values.get(&(*aid, idom)) {
@@ -564,16 +571,13 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             }
         }
 
-        // Track values at the end of each block more comprehensively
         let mut block_end_values: HashMap<(usize, BlockId), OperandVar> = end_values.clone();
 
-        // Update with any stores in each block
         for (bid, block) in &code.blocks {
             for instr in &block.instructions {
                 if let Instruction::Store { ptr, value } = instr.deref() {
                     if let Some((RegisterId::Local { aid }, _)) = ptr.get_register() {
                         if !inpromotable.contains(aid) {
-                            // Check if the stored value references a load that will be replaced
                             let stored_var = if let Some((rid, _)) = value.get_register() {
                                 if let Some(replacement) = replaces.get(rid) {
                                     replacement.clone()
@@ -595,7 +599,6 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
         let mut phinodes =
             BTreeMap::<(usize, BlockId), (Dtype, HashMap<BlockId, OperandVar>)>::new();
 
-        // Also add all join points to the stack
         for (aid, bid) in &joins_set {
             if phinode_visited.insert((*aid, *bid)) {
                 phinode_stack.push((*aid, *bid));
@@ -636,14 +639,12 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             let _unused = phinode_indexes.insert((*aid, *bid), index);
         }
 
-        // Final update: Apply all replacements to block_end_values after we know about phi nodes
         let mut final_block_end_values = HashMap::new();
         for ((aid, bid), operand_var) in &block_end_values {
             let updated = match operand_var {
                 OperandVar::Operand(operand) => {
                     if let Some((rid, dtype)) = operand.get_register() {
                         if let Some(replacement) = replaces.get(rid) {
-                            // This operand references a load that will be replaced
                             replacement.lookup(dtype, &phinode_indexes)
                         } else {
                             operand.clone()
@@ -663,14 +664,12 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             let _unused = final_block_end_values.insert((*aid, *bid), OperandVar::Operand(updated));
         }
 
-        // Also update the replaces map to use fully resolved values
         let mut final_replaces = HashMap::new();
         for (rid, operand_var) in &replaces {
             let resolved = match operand_var {
                 OperandVar::Operand(operand) => {
                     if let Some((inner_rid, dtype)) = operand.get_register() {
                         if let Some(inner_replacement) = replaces.get(inner_rid) {
-                            // This operand references another register that will be replaced
                             inner_replacement.clone()
                         } else {
                             operand_var.clone()
@@ -685,9 +684,7 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
         }
         let replaces = final_replaces;
 
-        // Manual operand replacement to work around potential Walk trait issues with Named<Instruction>
         for block in code.blocks.values_mut() {
-            // Replace operands in instructions
             for instr in block.instructions.iter_mut() {
                 match instr.deref_mut() {
                     Instruction::BinOp { lhs, rhs, .. } => {
@@ -765,7 +762,6 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                 }
             }
 
-            // Replace operands in block exit
             match &mut block.exit {
                 BlockExit::Jump { .. } => {}
                 BlockExit::ConditionalJump { condition, .. } => {
@@ -793,12 +789,9 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             }
         }
 
-        // Update jump arguments for phi nodes
-        // First, we need to know which allocations map to which phi node positions
         let mut allocation_to_phi_index: HashMap<(usize, BlockId), usize> = HashMap::new();
         for (bid, block) in &code.blocks {
             for (i, phi) in block.phinodes.iter().enumerate() {
-                // Find which allocation this phi node corresponds to
                 for (aid, alloc) in code.allocations.iter().enumerate() {
                     if alloc.name() == phi.name() {
                         let _unused = allocation_to_phi_index.insert((aid, *bid), i);
@@ -808,25 +801,20 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             }
         }
 
-        // Now update jump arguments based on the phinodes we created
         for ((aid, bid), (_, cases)) in &phinodes {
-            // Get the phi node index for this allocation/block
             let phi_index = *allocation_to_phi_index
                 .get(&(*aid, *bid))
                 .or_else(|| phinode_indexes.get(&(*aid, *bid)))
                 .expect("phi node index must exist");
 
-            // Find all jumps to this block and update their arguments
             for (bid_from, operand_var) in cases {
                 let block_from = code.blocks.get_mut(bid_from).unwrap();
                 block_from.exit.walk_jump_args(|jump_arg| {
                     if jump_arg.bid == *bid {
-                        // Find or add the argument for this phi node
                         let dtype = code.allocations.get(*aid).unwrap().deref();
                         let operand = match operand_var {
                             OperandVar::Operand(op) => op.clone(),
                             OperandVar::Phi((phi_aid, phi_bid)) => {
-                                // Check if this phi node actually exists
                                 if let Some(phi_index) = phinode_indexes.get(&(*phi_aid, *phi_bid))
                                 {
                                     Operand::register(
@@ -834,13 +822,11 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                                         dtype.clone(),
                                     )
                                 } else {
-                                    // If the phi node doesn't exist (e.g., for init block), use undef
                                     Operand::constant(Constant::undef(dtype.clone()))
                                 }
                             }
                         };
 
-                        // Ensure we have enough args - resize if needed
                         while jump_arg.args.len() <= phi_index {
                             jump_arg.args.push(Operand::constant(Constant::unit()));
                         }
@@ -850,8 +836,6 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             }
         }
 
-        // Also need to ensure that all jumps have the correct number of arguments
-        // First collect the expected number of arguments for each block
         let block_phinode_counts: HashMap<BlockId, usize> = code
             .blocks
             .iter()
@@ -862,35 +846,33 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             block.exit.walk_jump_args(|jump_arg| {
                 if let Some(&expected_args) = block_phinode_counts.get(&jump_arg.bid) {
                     while jump_arg.args.len() < expected_args {
-                        // This shouldn't happen if phi nodes are set up correctly,
-                        // but add a placeholder just in case
                         jump_arg.args.push(Operand::constant(Constant::unit()));
                     }
                 }
             });
         }
 
-        // Final pass: For each jump, ensure arguments match the values that should flow
-        // to the phi nodes in the target block
-        // First collect information about phi nodes in each block
         let block_phi_info: HashMap<BlockId, Vec<(usize, String, Dtype)>> = code
             .blocks
             .iter()
             .map(|(bid, block)| {
-                let phi_info = block
-                    .phinodes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, phi)| {
-                        let aid = code
-                            .allocations
-                            .iter()
-                            .position(|a| a.name() == phi.name())
-                            .unwrap_or(usize::MAX);
+                let mut phi_allocations = Vec::new();
+                for (aid, phi_bid) in phinodes.keys() {
+                    if phi_bid == bid {
+                        phi_allocations.push(*aid);
+                    }
+                }
+
+                phi_allocations.sort();
+
+                let phi_info = phi_allocations
+                    .into_iter()
+                    .map(|aid| {
+                        let alloc = code.allocations.get(aid).unwrap();
                         (
                             aid,
-                            phi.name().cloned().unwrap_or_default(),
-                            phi.deref().clone(),
+                            alloc.name().cloned().unwrap_or_default(),
+                            alloc.deref().clone(),
                         )
                     })
                     .collect();
@@ -898,7 +880,6 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             })
             .collect();
 
-        // Also collect phi node information for each block to avoid borrow checker issues
         let block_phi_names: HashMap<BlockId, Vec<Option<String>>> = code
             .blocks
             .iter()
@@ -910,19 +891,15 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             })
             .collect();
 
-        // Update final_block_end_values with any stores that happen in blocks
-        // This ensures we have the most up-to-date values when determining jump arguments
         for (bid, block) in &code.blocks {
             let mut current_values = HashMap::new();
 
-            // Start with values at block entry
             for aid in 0..code.allocations.len() {
                 if let Some(operand_var) = final_block_end_values.get(&(aid, *bid)) {
                     let _unused = current_values.insert(aid, operand_var.clone());
                 }
             }
 
-            // Update with stores in the block
             for instr in &block.instructions {
                 if let Instruction::Store { ptr, value } = instr.deref() {
                     if let Some((RegisterId::Local { aid }, _)) = ptr.get_register() {
@@ -934,7 +911,6 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                 }
             }
 
-            // Update final_block_end_values with the values at block exit
             for (aid, operand_var) in current_values {
                 let _unused = final_block_end_values.insert((aid, *bid), operand_var);
             }
@@ -945,16 +921,12 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             block_from.exit.walk_jump_args(|jump_arg| {
                 let bid_to = jump_arg.bid;
                 if let Some(phi_info) = block_phi_info.get(&bid_to) {
-                    // Ensure we have the correct number of arguments
                     while jump_arg.args.len() < phi_info.len() {
                         jump_arg.args.push(Operand::constant(Constant::unit()));
                     }
 
-                    // For each phi node in the target block, determine what value should flow from bid_from
                     for (i, (aid, phi_name, dtype)) in phi_info.iter().enumerate() {
                         if *aid != usize::MAX {
-                            // Look up what value this allocation has at the end of bid_from
-                            // If not found, walk up the dominator tree
                             let mut value = None;
                             let mut current_bid = bid_from;
 
@@ -966,7 +938,6 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                                     break;
                                 }
 
-                                // Check if there's a phi node in the current block
                                 if let Some(phi_idx) =
                                     block_phi_names.get(&current_bid).and_then(|names| {
                                         names.iter().position(|n| n.as_ref() == Some(phi_name))
@@ -979,7 +950,6 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                                     break;
                                 }
 
-                                // Walk up the dominator tree
                                 current_bid = match domtree.idom(current_bid) {
                                     Some(idom) => idom,
                                     None => break,
@@ -987,13 +957,11 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                             }
 
                             jump_arg.args[i] = value.unwrap_or_else(|| {
-                                // No value found, use undef
                                 Operand::constant(Constant::undef(dtype.clone()))
                             });
                         }
                     }
 
-                    // Trim any extra arguments
                     jump_arg.args.truncate(phi_info.len());
                 }
             });
