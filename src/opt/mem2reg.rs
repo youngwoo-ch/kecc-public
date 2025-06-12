@@ -42,31 +42,31 @@ macro_rules! some_or {
     };
 }
 
-fn make_cfg(fdef: &FunctionDefinition) -> HashMap<BlockId, Vec<JumpArg>> {
-    fdef.blocks
-        .iter()
-        .map(|(bid, block)| {
-            let mut args = Vec::new();
-            match &block.exit {
-                BlockExit::Jump { arg } => args.push(arg.clone()),
-                BlockExit::ConditionalJump {
-                    arg_then, arg_else, ..
-                } => {
-                    args.push(arg_then.clone());
-                    args.push(arg_else.clone());
-                }
-                BlockExit::Switch { default, cases, .. } => {
-                    args.push(default.clone());
-                    for (_, arg) in cases {
-                        args.push(arg.clone());
-                    }
-                }
-                _ => {}
-            }
-            (*bid, args)
-        })
-        .collect()
-}
+// fn make_cfg(fdef: &FunctionDefinition) -> HashMap<BlockId, Vec<JumpArg>> {
+//     fdef.blocks
+//         .iter()
+//         .map(|(bid, block)| {
+//             let mut args = Vec::new();
+//             match &block.exit {
+//                 BlockExit::Jump { arg } => args.push(arg.clone()),
+//                 BlockExit::ConditionalJump {
+//                     arg_then, arg_else, ..
+//                 } => {
+//                     args.push(arg_then.clone());
+//                     args.push(arg_else.clone());
+//                 }
+//                 BlockExit::Switch { default, cases, .. } => {
+//                     args.push(default.clone());
+//                     for (_, arg) in cases {
+//                         args.push(arg.clone());
+//                     }
+//                 }
+//                 _ => {}
+//             }
+//             (*bid, args)
+//         })
+//         .collect()
+// }
 
 fn reverse_cfg(cfg: &HashMap<BlockId, Vec<JumpArg>>) -> HashMap<BlockId, Vec<(BlockId, JumpArg)>> {
     let mut result = HashMap::new();
