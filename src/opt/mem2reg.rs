@@ -9,6 +9,30 @@ use crate::opt::*;
 
 use core::cmp::Ordering;
 
+type JoinPoints = HashMap<usize, HashSet<BlockId>>;
+type JoinPointsSet = HashSet<(usize, BlockId)>;
+type PhiNodeData = BTreeMap<(usize, BlockId), (Dtype, HashMap<BlockId, OperandVar>)>;
+type RenameResults = (
+    HashMap<RegisterId, OperandVar>,
+    HashMap<(usize, BlockId), OperandVar>,
+    HashSet<(usize, BlockId)>,
+);
+
+struct ReachingDefContext<'a> {
+    end_values: &'a HashMap<(usize, BlockId), OperandVar>,
+    joins_set: &'a HashSet<(usize, BlockId)>,
+    domtree: &'a Domtree,
+    bid_init: BlockId,
+    allocations: &'a [Named<Dtype>],
+}
+
+struct PhiValueContext<'a> {
+    final_block_end_values: &'a HashMap<(usize, BlockId), OperandVar>,
+    block_phi_names: &'a HashMap<BlockId, Vec<Option<String>>>,
+    phinode_indexes: &'a HashMap<(usize, BlockId), usize>,
+    domtree: &'a Domtree,
+}
+
 macro_rules! some_or {
     ($expr:expr, $alt:expr) => {
         match $expr {
@@ -394,14 +418,12 @@ fn mark_address_taken(address_taken: &mut HashSet<usize>, operand: &Operand) {
         let _unused = address_taken.insert(*aid);
     }
 
-    match operand {
-        Operand::Register {
-            rid: RegisterId::Local { aid },
-            ..
-        } => {
-            let _unused = address_taken.insert(*aid);
-        }
-        _ => {}
+    if let Operand::Register {
+        rid: RegisterId::Local { aid },
+        ..
+    } = operand
+    {
+        let _unused = address_taken.insert(*aid);
     }
 }
 
@@ -529,7 +551,7 @@ impl Mem2regInner {
         stores: &HashMap<usize, Vec<BlockId>>,
         inpromotable: &HashSet<usize>,
         domtree: &Domtree,
-    ) -> (HashMap<usize, HashSet<BlockId>>, HashSet<(usize, BlockId)>) {
+    ) -> (JoinPoints, JoinPointsSet) {
         let joins: HashMap<usize, HashSet<BlockId>> = stores
             .iter()
             .filter(|(aid, _)| !inpromotable.contains(*aid))
@@ -565,11 +587,7 @@ impl Mem2regInner {
         joins_set: &HashSet<(usize, BlockId)>,
         join_table: &mut JoinTable<'_>,
         domtree: &Domtree,
-    ) -> (
-        HashMap<RegisterId, OperandVar>,
-        HashMap<(usize, BlockId), OperandVar>,
-        HashSet<(usize, BlockId)>,
-    ) {
+    ) -> RenameResults {
         let mut replaces = HashMap::<RegisterId, OperandVar>::new();
         let mut phinode_needed = HashSet::<(usize, BlockId)>::new();
         let mut end_values = HashMap::<(usize, BlockId), OperandVar>::new();
@@ -609,16 +627,19 @@ impl Mem2regInner {
                             let var = if let Some(current_var) = current_values.get(aid) {
                                 current_var.clone()
                             } else {
+                                let ctx = ReachingDefContext {
+                                    end_values: &end_values,
+                                    joins_set,
+                                    domtree,
+                                    bid_init: code.bid_init,
+                                    allocations: &code.allocations,
+                                };
                                 let reaching_var = self.find_reaching_definition(
                                     *aid,
                                     *bid,
-                                    &end_values,
-                                    joins_set,
+                                    &ctx,
                                     join_table,
-                                    domtree,
-                                    code.bid_init,
                                     &mut phinode_needed,
-                                    &code.allocations,
                                 );
                                 let _unused = current_values.insert(*aid, reaching_var.clone());
                                 reaching_var
@@ -641,47 +662,43 @@ impl Mem2regInner {
         &self,
         aid: usize,
         bid: BlockId,
-        end_values: &HashMap<(usize, BlockId), OperandVar>,
-        joins_set: &HashSet<(usize, BlockId)>,
+        ctx: &ReachingDefContext<'_>,
         join_table: &mut JoinTable<'_>,
-        domtree: &Domtree,
-        bid_init: BlockId,
         phinode_needed: &mut HashSet<(usize, BlockId)>,
-        allocations: &Vec<Named<Dtype>>,
     ) -> OperandVar {
-        if let Some(var) = end_values.get(&(aid, bid)) {
+        if let Some(var) = ctx.end_values.get(&(aid, bid)) {
             return var.clone();
         }
 
-        if joins_set.contains(&(aid, bid)) {
+        if ctx.joins_set.contains(&(aid, bid)) {
             return OperandVar::Phi((aid, bid));
         }
 
         let bid_join = join_table.lookup(aid, bid);
 
-        if bid_join == bid && joins_set.contains(&(aid, bid)) {
+        if bid_join == bid && ctx.joins_set.contains(&(aid, bid)) {
             return OperandVar::Phi((aid, bid));
         }
 
-        if let Some(val) = end_values.get(&(aid, bid_join)) {
+        if let Some(val) = ctx.end_values.get(&(aid, bid_join)) {
             val.clone()
         } else {
             let mut found = None;
             let mut current = bid;
 
-            if let Some(idom) = domtree.idom(current) {
-                if joins_set.contains(&(aid, idom)) {
+            if let Some(idom) = ctx.domtree.idom(current) {
+                if ctx.joins_set.contains(&(aid, idom)) {
                     found = Some(OperandVar::Phi((aid, idom)));
                 }
             }
 
             if found.is_none() {
-                while let Some(idom) = domtree.idom(current) {
-                    if let Some(val) = end_values.get(&(aid, idom)) {
+                while let Some(idom) = ctx.domtree.idom(current) {
+                    if let Some(val) = ctx.end_values.get(&(aid, idom)) {
                         found = Some(val.clone());
                         break;
                     }
-                    if joins_set.contains(&(aid, idom)) {
+                    if ctx.joins_set.contains(&(aid, idom)) {
                         found = Some(OperandVar::Phi((aid, idom)));
                         break;
                     }
@@ -690,8 +707,8 @@ impl Mem2regInner {
             }
 
             found.unwrap_or_else(|| {
-                if bid_join == bid_init {
-                    let dtype = allocations.get(aid).unwrap().deref();
+                if bid_join == ctx.bid_init {
+                    let dtype = ctx.allocations.get(aid).unwrap().deref();
                     OperandVar::Operand(Operand::constant(Constant::undef(dtype.clone())))
                 } else {
                     let _unused = phinode_needed.insert((aid, bid_join));
@@ -742,7 +759,7 @@ impl Mem2regInner {
         end_values: &HashMap<(usize, BlockId), OperandVar>,
         reverse_cfg: &HashMap<BlockId, Vec<(BlockId, JumpArg)>>,
         join_table: &mut JoinTable<'_>,
-    ) -> BTreeMap<(usize, BlockId), (Dtype, HashMap<BlockId, OperandVar>)> {
+    ) -> PhiNodeData {
         let mut phinode_visited = phinode_needed.clone();
         let mut phinode_stack = phinode_visited.iter().cloned().collect::<Vec<_>>();
         let mut phinodes = BTreeMap::new();
@@ -782,7 +799,7 @@ impl Mem2regInner {
     fn insert_phi_nodes(
         &self,
         code: &mut FunctionDefinition,
-        phinodes: &BTreeMap<(usize, BlockId), (Dtype, HashMap<BlockId, OperandVar>)>,
+        phinodes: &PhiNodeData,
     ) -> HashMap<(usize, BlockId), usize> {
         let mut phinode_indexes = HashMap::new();
 
@@ -1010,7 +1027,7 @@ impl Mem2regInner {
     fn wire_phi_arguments(
         &self,
         code: &mut FunctionDefinition,
-        phinodes: &BTreeMap<(usize, BlockId), (Dtype, HashMap<BlockId, OperandVar>)>,
+        phinodes: &PhiNodeData,
         phinode_indexes: &HashMap<(usize, BlockId), usize>,
         final_block_end_values: &HashMap<(usize, BlockId), OperandVar>,
         domtree: &Domtree,
@@ -1104,7 +1121,7 @@ impl Mem2regInner {
     fn resolve_complex_phi_dependencies(
         &self,
         code: &mut FunctionDefinition,
-        phinodes: &BTreeMap<(usize, BlockId), (Dtype, HashMap<BlockId, OperandVar>)>,
+        phinodes: &PhiNodeData,
         phinode_indexes: &HashMap<(usize, BlockId), usize>,
         final_block_end_values: &HashMap<(usize, BlockId), OperandVar>,
         domtree: &Domtree,
@@ -1123,16 +1140,13 @@ impl Mem2regInner {
 
                     for (i, (aid, phi_name, dtype)) in phi_info.iter().enumerate() {
                         if *aid != usize::MAX {
-                            let value = self.find_phi_value(
-                                *aid,
-                                bid_from,
-                                phi_name,
-                                dtype,
+                            let ctx = PhiValueContext {
                                 final_block_end_values,
-                                &block_phi_names,
+                                block_phi_names: &block_phi_names,
                                 phinode_indexes,
                                 domtree,
-                            );
+                            };
+                            let value = self.find_phi_value(*aid, bid_from, phi_name, dtype, &ctx);
                             jump_arg.args[i] = value;
                         }
                     }
@@ -1146,11 +1160,11 @@ impl Mem2regInner {
     fn build_block_phi_info(
         &self,
         code: &FunctionDefinition,
-        phinodes: &BTreeMap<(usize, BlockId), (Dtype, HashMap<BlockId, OperandVar>)>,
+        phinodes: &PhiNodeData,
     ) -> HashMap<BlockId, Vec<(usize, String, Dtype)>> {
         code.blocks
-            .iter()
-            .map(|(bid, _)| {
+            .keys()
+            .map(|bid| {
                 let mut phi_allocations = Vec::new();
                 for (aid, phi_bid) in phinodes.keys() {
                     if phi_bid == bid {
@@ -1197,17 +1211,14 @@ impl Mem2regInner {
         mut current_bid: BlockId,
         phi_name: &str,
         dtype: &Dtype,
-        final_block_end_values: &HashMap<(usize, BlockId), OperandVar>,
-        block_phi_names: &HashMap<BlockId, Vec<Option<String>>>,
-        phinode_indexes: &HashMap<(usize, BlockId), usize>,
-        domtree: &Domtree,
+        ctx: &PhiValueContext<'_>,
     ) -> Operand {
         loop {
-            if let Some(operand_var) = final_block_end_values.get(&(aid, current_bid)) {
-                return operand_var.lookup(dtype, phinode_indexes);
+            if let Some(operand_var) = ctx.final_block_end_values.get(&(aid, current_bid)) {
+                return operand_var.lookup(dtype, ctx.phinode_indexes);
             }
 
-            if let Some(phi_idx) = block_phi_names.get(&current_bid).and_then(|names| {
+            if let Some(phi_idx) = ctx.block_phi_names.get(&current_bid).and_then(|names| {
                 names
                     .iter()
                     .position(|n| n.as_ref().map(|s| s.as_str()) == Some(phi_name))
@@ -1215,7 +1226,7 @@ impl Mem2regInner {
                 return Operand::register(RegisterId::arg(current_bid, phi_idx), dtype.clone());
             }
 
-            current_bid = match domtree.idom(current_bid) {
+            current_bid = match ctx.domtree.idom(current_bid) {
                 Some(idom) => idom,
                 None => break,
             };
