@@ -29,6 +29,11 @@ enum ValueExpr {
         value: Operand,
         target_dtype: Dtype,
     },
+    GetElementPtr {
+        ptr: Operand,
+        offset: Operand,
+        dtype: Dtype,
+    },
 }
 
 impl Optimize<FunctionDefinition> for GvnInner {
@@ -50,6 +55,71 @@ impl Optimize<FunctionDefinition> for GvnInner {
         let mut rpo = post_order;
         rpo.reverse();
 
+        // Analyze constant propagation through block parameters
+        for &bid in &rpo {
+            if let Some(block) = code.blocks.get(&bid) {
+                // For each phi node, check if all predecessors pass the same constant
+                for (phi_idx, phi) in block.phinodes.iter().enumerate() {
+                    if let Some(preds) = reverse_cfg.get(&bid) {
+                        let mut constant_value: Option<Operand> = None;
+                        let mut all_same = true;
+
+                        for (pred_bid, _) in preds {
+                            if let Some(pred_block) = code.blocks.get(pred_bid) {
+                                match &pred_block.exit {
+                                    BlockExit::Jump { arg } => {
+                                        if arg.bid == bid && phi_idx < arg.args.len() {
+                                            let arg_val = &arg.args[phi_idx];
+                                            if let Some(ref const_val) = constant_value {
+                                                if arg_val != const_val {
+                                                    all_same = false;
+                                                    break;
+                                                }
+                                            } else {
+                                                constant_value = Some(arg_val.clone());
+                                            }
+                                        }
+                                    }
+                                    BlockExit::ConditionalJump {
+                                        arg_then, arg_else, ..
+                                    } => {
+                                        let arg = if arg_then.bid == bid {
+                                            arg_then
+                                        } else if arg_else.bid == bid {
+                                            arg_else
+                                        } else {
+                                            continue;
+                                        };
+
+                                        if phi_idx < arg.args.len() {
+                                            let arg_val = &arg.args[phi_idx];
+                                            if let Some(ref const_val) = constant_value {
+                                                if arg_val != const_val {
+                                                    all_same = false;
+                                                    break;
+                                                }
+                                            } else {
+                                                constant_value = Some(arg_val.clone());
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        // If all predecessors pass the same value, replace the phi node with that value
+                        if all_same && constant_value.is_some() {
+                            let rid = RegisterId::arg(bid, phi_idx);
+                            let value = constant_value.unwrap();
+                            let _unused = replacements.insert(rid, value);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // First pass: find redundant expressions and mark them for replacement
         for &bid in &rpo {
             let block = code.blocks.get(&bid).unwrap();
@@ -69,20 +139,51 @@ impl Optimize<FunctionDefinition> for GvnInner {
                             rhs: normalized_rhs.clone(),
                         };
 
-                        // Check if this expression has been computed before
-                        if let Some(&first_rid) = expr_to_first_occurrence.get(&expr) {
-                            // Check if the first occurrence dominates this one
-                            if dominates_register(&domtree, first_rid, bid) {
-                                // Replace this computation with the first occurrence
-                                let _unused = replacements
-                                    .insert(rid, Operand::register(first_rid, instr.dtype()));
-                                changed = true;
-                            } else {
-                                // This is a new occurrence that doesn't have a dominating definition
-                                let _unused = expr_to_first_occurrence.insert(expr, rid);
+                        // Look for an existing computation we can reuse
+                        let mut found_replacement = false;
+
+                        // Search through all blocks that dominate this one
+                        let mut search_blocks = vec![bid];
+                        let mut current = bid;
+                        while let Some(idom) = domtree.idom(current) {
+                            search_blocks.push(idom);
+                            current = idom;
+                        }
+
+                        // Search in reverse order (from root to current) to find the first occurrence
+                        search_blocks.reverse();
+
+                        for &search_bid in &search_blocks {
+                            if let Some(search_block) = code.blocks.get(&search_bid) {
+                                for (j, search_instr) in
+                                    search_block.instructions.iter().enumerate()
+                                {
+                                    let search_rid = RegisterId::temp(search_bid, j);
+
+                                    // Don't compare with ourselves
+                                    if search_rid == rid {
+                                        continue;
+                                    }
+
+                                    // Check if this instruction computes the same expression
+                                    if matches_expr(search_instr.deref(), &expr, &replacements) {
+                                        let _unused = replacements.insert(
+                                            rid,
+                                            Operand::register(search_rid, instr.dtype()),
+                                        );
+                                        changed = true;
+                                        found_replacement = true;
+                                        break;
+                                    }
+                                }
+                                if found_replacement {
+                                    break;
+                                }
                             }
-                        } else {
-                            // This is the first occurrence of this expression
+                        }
+
+                        // If no replacement found, record this as the first occurrence
+                        if !found_replacement {
                             let _unused = expr_to_first_occurrence.insert(expr, rid);
                         }
                     }
@@ -115,6 +216,28 @@ impl Optimize<FunctionDefinition> for GvnInner {
                         let expr = ValueExpr::TypeCast {
                             value: normalized_value.clone(),
                             target_dtype: target_dtype.clone(),
+                        };
+
+                        if let Some(&first_rid) = expr_to_first_occurrence.get(&expr) {
+                            if dominates_register(&domtree, first_rid, bid) {
+                                let _unused = replacements
+                                    .insert(rid, Operand::register(first_rid, instr.dtype()));
+                                changed = true;
+                            } else {
+                                let _unused = expr_to_first_occurrence.insert(expr, rid);
+                            }
+                        } else {
+                            let _unused = expr_to_first_occurrence.insert(expr, rid);
+                        }
+                    }
+                    Instruction::GetElementPtr { ptr, offset, dtype } => {
+                        let normalized_ptr = apply_replacement(ptr, &replacements);
+                        let normalized_offset = apply_replacement(offset, &replacements);
+
+                        let expr = ValueExpr::GetElementPtr {
+                            ptr: normalized_ptr.clone(),
+                            offset: normalized_offset.clone(),
+                            dtype: dtype.clone(),
                         };
 
                         if let Some(&first_rid) = expr_to_first_occurrence.get(&expr) {
@@ -397,6 +520,22 @@ fn matches_expr(
                 target_dtype: e_dtype,
             },
         ) => i_dtype == e_dtype && apply_replacement(i_value, replacements) == *e_value,
+        (
+            Instruction::GetElementPtr {
+                ptr: i_ptr,
+                offset: i_offset,
+                dtype: i_dtype,
+            },
+            ValueExpr::GetElementPtr {
+                ptr: e_ptr,
+                offset: e_offset,
+                dtype: e_dtype,
+            },
+        ) => {
+            i_dtype == e_dtype
+                && apply_replacement(i_ptr, replacements) == *e_ptr
+                && apply_replacement(i_offset, replacements) == *e_offset
+        }
         _ => false,
     }
 }
