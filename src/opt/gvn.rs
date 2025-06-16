@@ -88,38 +88,61 @@ impl Optimize<FunctionDefinition> for GvnInner {
         rpo.reverse();
 
         // Phase 1: Analyze constant propagation through block parameters
-        changed |= propagate_constants_through_phi_nodes(
-            &rpo,
-            &code.blocks,
-            &reverse_cfg,
-            &mut replacements,
-        );
+        // Run this phase to fixed point with a limit to prevent infinite loops
+        let mut iterations = 0;
+        const MAX_ITERATIONS: usize = 30;
 
-        // Phase 2: Find redundant expressions and mark them for replacement
-        changed |= find_redundant_expressions(
-            &rpo,
-            &code.blocks,
-            &domtree,
-            &mut replacements,
-            &mut expr_to_first_occurrence,
-        );
+        loop {
+            iterations += 1;
+            let mut changed_this_round = false;
 
-        // Phase 3: Generate phi nodes for expressions available from multiple predecessors
-        let phi_nodes_to_add = generate_phi_nodes_for_expressions(
-            &rpo,
-            &code.blocks,
-            &reverse_cfg,
-            &mut replacements,
-            &mut changed,
-        );
+            changed_this_round |= propagate_constants_through_phi_nodes(
+                &rpo,
+                &code.blocks,
+                &reverse_cfg,
+                &mut replacements,
+            );
 
-        // Phase 4: Apply replacements
-        if !replacements.is_empty() {
-            apply_replacements(code, &replacements);
+            // Phase 2: GVN
+            changed_this_round |= find_redundant_expressions(
+                &rpo,
+                &code.blocks,
+                &domtree,
+                &mut replacements,
+                &mut expr_to_first_occurrence,
+            );
+
+            // Phase 3
+            let phi_nodes_to_add = generate_phi_nodes_for_expressions(
+                &rpo,
+                &code.blocks,
+                &reverse_cfg,
+                &domtree,
+                &mut replacements,
+                &mut changed_this_round,
+            );
+
+            // Phase 4
+            if !phi_nodes_to_add.is_empty() {
+                add_phi_nodes(code, phi_nodes_to_add);
+                changed_this_round = true;
+            }
+
+            // Phase 5
+            changed_this_round |=
+                propagate_phi_equivalences(&rpo, &code.blocks, &reverse_cfg, &mut replacements);
+
+            if !changed_this_round || iterations >= MAX_ITERATIONS {
+                break;
+            }
+
+            // Phase 6: Apply replacements if any were found
+            if !replacements.is_empty() {
+                apply_replacements(code, &replacements);
+            }
+
+            changed = true;
         }
-
-        // Phase 5: Add phi nodes and update jump arguments
-        add_phi_nodes(code, phi_nodes_to_add);
 
         changed
     }
@@ -146,14 +169,16 @@ fn propagate_constants_through_phi_nodes(
                             match &pred_block.exit {
                                 BlockExit::Jump { arg } => {
                                     if arg.bid == bid && phi_idx < arg.args.len() {
-                                        let arg_val = &arg.args[phi_idx];
+                                        // Apply replacements to see the actual value being passed
+                                        let arg_val =
+                                            apply_replacement(&arg.args[phi_idx], replacements);
                                         if let Some(ref const_val) = constant_value {
-                                            if arg_val != const_val {
+                                            if &arg_val != const_val {
                                                 all_same = false;
                                                 break;
                                             }
                                         } else {
-                                            constant_value = Some(arg_val.clone());
+                                            constant_value = Some(arg_val);
                                         }
                                     }
                                 }
@@ -169,42 +194,50 @@ fn propagate_constants_through_phi_nodes(
                                     };
 
                                     if phi_idx < arg.args.len() {
-                                        let arg_val = &arg.args[phi_idx];
+                                        // Apply replacements to see the actual value being passed
+                                        let arg_val =
+                                            apply_replacement(&arg.args[phi_idx], replacements);
                                         if let Some(ref const_val) = constant_value {
-                                            if arg_val != const_val {
+                                            if &arg_val != const_val {
                                                 all_same = false;
                                                 break;
                                             }
                                         } else {
-                                            constant_value = Some(arg_val.clone());
+                                            constant_value = Some(arg_val);
                                         }
                                     }
                                 }
                                 BlockExit::Switch { default, cases, .. } => {
                                     // Check default case
                                     if default.bid == bid && phi_idx < default.args.len() {
-                                        let arg_val = &default.args[phi_idx];
+                                        // Apply replacements to see the actual value being passed
+                                        let arg_val =
+                                            apply_replacement(&default.args[phi_idx], replacements);
                                         if let Some(ref const_val) = constant_value {
-                                            if arg_val != const_val {
+                                            if &arg_val != const_val {
                                                 all_same = false;
                                                 break;
                                             }
                                         } else {
-                                            constant_value = Some(arg_val.clone());
+                                            constant_value = Some(arg_val);
                                         }
                                     }
 
                                     // Check all switch cases
                                     for (_, case_arg) in cases {
                                         if case_arg.bid == bid && phi_idx < case_arg.args.len() {
-                                            let arg_val = &case_arg.args[phi_idx];
+                                            // Apply replacements to see the actual value being passed
+                                            let arg_val = apply_replacement(
+                                                &case_arg.args[phi_idx],
+                                                replacements,
+                                            );
                                             if let Some(ref const_val) = constant_value {
-                                                if arg_val != const_val {
+                                                if &arg_val != const_val {
                                                     all_same = false;
                                                     break;
                                                 }
                                             } else {
-                                                constant_value = Some(arg_val.clone());
+                                                constant_value = Some(arg_val);
                                             }
                                         }
                                     }
@@ -283,6 +316,7 @@ fn find_value_in_block(
     blocks: &BTreeMap<BlockId, Block>,
     replacements: &HashMap<RegisterId, Operand>,
 ) -> Option<Operand> {
+    // First, check if the value is computed in this block
     let block = blocks.get(&bid)?;
 
     for (i, instr) in block.instructions.iter().enumerate() {
@@ -312,6 +346,38 @@ fn find_value_in_block(
         if matches_expr(instr.deref(), expr, replacements) {
             return Some(Operand::register(rid, instr.dtype()));
         }
+    }
+
+    None
+}
+
+fn find_value_in_block_or_dominators(
+    expr: &ValueExpr,
+    bid: BlockId,
+    blocks: &BTreeMap<BlockId, Block>,
+    domtree: &Domtree,
+    replacements: &HashMap<RegisterId, Operand>,
+) -> Option<Operand> {
+    // First check the block itself
+    if let Some(value) = find_value_in_block(expr, bid, blocks, replacements) {
+        return Some(value);
+    }
+
+    // Then check dominating blocks
+    let mut current = bid;
+    while let Some(idom) = domtree.idom(current) {
+        if let Some(value) = find_value_in_block(expr, idom, blocks, replacements) {
+            // Make sure the value dominates the original block
+            if let Some((rid, _)) = value.get_register() {
+                if dominates_register(domtree, *rid, bid) {
+                    return Some(value);
+                }
+            } else {
+                // Constants always dominate
+                return Some(value);
+            }
+        }
+        current = idom;
     }
 
     None
@@ -475,6 +541,23 @@ fn find_existing_computation(
     replacements: &HashMap<RegisterId, Operand>,
     dtype: Dtype,
 ) -> Option<Operand> {
+    // First check if this expression uses any phi node parameters from the current block
+    // If it does, we cannot replace it with a value from a dominating block
+    let uses_current_phi = match expr {
+        ValueExpr::BinOp { lhs, rhs, .. } => {
+            matches_phi_from_block(lhs, current_bid) || matches_phi_from_block(rhs, current_bid)
+        }
+        ValueExpr::UnaryOp { operand, .. } => matches_phi_from_block(operand, current_bid),
+        ValueExpr::TypeCast { value, .. } => matches_phi_from_block(value, current_bid),
+        ValueExpr::GetElementPtr { ptr, offset, .. } => {
+            matches_phi_from_block(ptr, current_bid) || matches_phi_from_block(offset, current_bid)
+        }
+    };
+
+    if uses_current_phi {
+        return None;
+    }
+
     // Search through all blocks that dominate this one
     let mut search_blocks = vec![current_bid];
     let mut current = current_bid;
@@ -521,10 +604,22 @@ fn find_existing_computation(
     None
 }
 
+fn matches_phi_from_block(operand: &Operand, bid: BlockId) -> bool {
+    if let Some((rid, _)) = operand.get_register() {
+        match rid {
+            RegisterId::Arg { bid: arg_bid, .. } => *arg_bid == bid,
+            _ => false,
+        }
+    } else {
+        false
+    }
+}
+
 fn generate_phi_nodes_for_expressions(
     rpo: &[BlockId],
     blocks: &BTreeMap<BlockId, Block>,
     reverse_cfg: &HashMap<BlockId, Vec<(BlockId, JumpArg)>>,
+    domtree: &Domtree,
     replacements: &mut HashMap<RegisterId, Operand>,
     changed: &mut bool,
 ) -> HashMap<BlockId, Vec<(Dtype, Vec<(BlockId, Operand)>)>> {
@@ -554,35 +649,69 @@ fn generate_phi_nodes_for_expressions(
                     if let Some(expr) = expr_opt {
                         // Check if this expression is available from predecessors
                         let mut pred_values: Vec<(BlockId, Operand)> = Vec::new();
+                        let mut all_same_value = true;
+                        let mut first_value: Option<Operand> = None;
+
                         for (pred_bid, _) in preds {
-                            if let Some(value) =
-                                find_value_in_block(&expr, *pred_bid, blocks, replacements)
-                            {
-                                pred_values.push((*pred_bid, value));
+                            if let Some(value) = find_value_in_block_or_dominators(
+                                &expr,
+                                *pred_bid,
+                                blocks,
+                                domtree,
+                                replacements,
+                            ) {
+                                pred_values.push((*pred_bid, value.clone()));
+
+                                // Check if all values are the same
+                                if let Some(ref fv) = first_value {
+                                    if &value != fv {
+                                        all_same_value = false;
+                                    }
+                                } else {
+                                    first_value = Some(value);
+                                }
                             }
                         }
 
-                        // If available from all predecessors, create phi node
+                        // If available from all predecessors
                         if pred_values.len() == preds.len() {
-                            // Calculate the absolute phi index by adding existing phi nodes count
-                            let existing_phi_count = block.phinodes.len();
-                            let relative_phi_idx = phi_nodes_to_add.entry(bid).or_default().len();
-                            let absolute_phi_idx = existing_phi_count + relative_phi_idx;
+                            // If all predecessors provide the exact same value, just use that value
+                            if all_same_value && first_value.is_some() {
+                                let value = first_value.unwrap();
+                                // Only replace if the value is different from the current register
+                                if let Some((value_rid, _)) = value.get_register() {
+                                    if value_rid != &rid {
+                                        let _unused = replacements.insert(rid, value);
+                                        *changed = true;
+                                    }
+                                } else {
+                                    // Constants and other operands
+                                    let _unused = replacements.insert(rid, value);
+                                    *changed = true;
+                                }
+                            } else {
+                                // Different values from predecessors, create a phi node
+                                // Calculate the absolute phi index by adding existing phi nodes count
+                                let existing_phi_count = block.phinodes.len();
+                                let relative_phi_idx =
+                                    phi_nodes_to_add.entry(bid).or_default().len();
+                                let absolute_phi_idx = existing_phi_count + relative_phi_idx;
 
-                            phi_nodes_to_add
-                                .entry(bid)
-                                .or_default()
-                                .push((instr.dtype(), pred_values));
+                                phi_nodes_to_add
+                                    .entry(bid)
+                                    .or_default()
+                                    .push((instr.dtype(), pred_values));
 
-                            // Replace this instruction with phi node reference using absolute index
-                            let _unused = replacements.insert(
-                                rid,
-                                Operand::register(
-                                    RegisterId::arg(bid, absolute_phi_idx),
-                                    instr.dtype(),
-                                ),
-                            );
-                            *changed = true;
+                                // Replace uses of this instruction with phi node reference
+                                let _unused = replacements.insert(
+                                    rid,
+                                    Operand::register(
+                                        RegisterId::arg(bid, absolute_phi_idx),
+                                        instr.dtype(),
+                                    ),
+                                );
+                                *changed = true;
+                            }
                         }
                     }
                 }
@@ -706,4 +835,140 @@ fn update_jump_arguments(
         }
         _ => {}
     }
+}
+
+// New function to find and propagate equivalences between computed values and phi parameters
+fn propagate_phi_equivalences(
+    rpo: &[BlockId],
+    blocks: &BTreeMap<BlockId, Block>,
+    reverse_cfg: &HashMap<BlockId, Vec<(BlockId, JumpArg)>>,
+    replacements: &mut HashMap<RegisterId, Operand>,
+) -> bool {
+    let mut changed = false;
+
+    // For each block
+    for &bid in rpo {
+        let block = blocks.get(&bid).unwrap();
+
+        // For each phi node in the block
+        for (phi_idx, phi) in block.phinodes.iter().enumerate() {
+            let phi_rid = RegisterId::arg(bid, phi_idx);
+
+            // Skip if the phi itself was replaced
+            if replacements.contains_key(&phi_rid) {
+                continue;
+            }
+
+            // Check what expression this phi represents by examining what all predecessors pass
+            if let Some(preds) = reverse_cfg.get(&bid) {
+                // First, determine what expression all predecessors are passing
+                let mut common_expr: Option<ValueExpr> = None;
+                let mut all_same = true;
+
+                for (pred_bid, _) in preds {
+                    if let Some(pred_block) = blocks.get(pred_bid) {
+                        // Find what value this predecessor passes to this phi
+                        let passed_value = match &pred_block.exit {
+                            BlockExit::Jump { arg } => {
+                                if arg.bid == bid && phi_idx < arg.args.len() {
+                                    Some(&arg.args[phi_idx])
+                                } else {
+                                    None
+                                }
+                            }
+                            BlockExit::ConditionalJump {
+                                arg_then, arg_else, ..
+                            } => {
+                                if arg_then.bid == bid && phi_idx < arg_then.args.len() {
+                                    Some(&arg_then.args[phi_idx])
+                                } else if arg_else.bid == bid && phi_idx < arg_else.args.len() {
+                                    Some(&arg_else.args[phi_idx])
+                                } else {
+                                    None
+                                }
+                            }
+                            BlockExit::Switch { default, cases, .. } => {
+                                if default.bid == bid && phi_idx < default.args.len() {
+                                    Some(&default.args[phi_idx])
+                                } else {
+                                    cases.iter().find_map(|(_, case_arg)| {
+                                        if case_arg.bid == bid && phi_idx < case_arg.args.len() {
+                                            Some(&case_arg.args[phi_idx])
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                }
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(passed_operand) = passed_value {
+                            // Apply replacements to see the actual value
+                            let actual_value = apply_replacement(passed_operand, replacements);
+
+                            // Check what expression this value represents
+                            if let Some((value_rid, _)) = actual_value.get_register() {
+                                if let RegisterId::Temp {
+                                    bid: value_bid,
+                                    iid: value_iid,
+                                } = value_rid
+                                {
+                                    if let Some(value_block) = blocks.get(value_bid) {
+                                        if let Some(value_instr) =
+                                            value_block.instructions.get(*value_iid)
+                                        {
+                                            if let Some(expr) = instruction_to_expr(
+                                                value_instr.deref(),
+                                                replacements,
+                                            ) {
+                                                if let Some(ref ce) = common_expr {
+                                                    if ce != &expr {
+                                                        all_same = false;
+                                                        break;
+                                                    }
+                                                } else {
+                                                    common_expr = Some(expr);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // If all predecessors pass values that compute the same expression
+                if all_same && common_expr.is_some() {
+                    let expr = common_expr.unwrap();
+
+                    // Find instructions in this block that compute the same expression
+                    for (i, instr) in block.instructions.iter().enumerate() {
+                        let rid = RegisterId::temp(bid, i);
+
+                        // Skip if already replaced
+                        if replacements.contains_key(&rid) {
+                            continue;
+                        }
+
+                        // Check type compatibility
+                        if instr.dtype() != *phi.deref() {
+                            continue;
+                        }
+
+                        // Check if this instruction computes the same expression
+                        if matches_expr(instr.deref(), &expr, replacements) {
+                            // Replace this instruction with the phi
+                            let _unused = replacements
+                                .insert(rid, Operand::register(phi_rid, phi.deref().clone()));
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    changed
 }
