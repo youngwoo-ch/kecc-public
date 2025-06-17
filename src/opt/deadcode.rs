@@ -224,16 +224,11 @@ fn remove_dead_phinodes(code: &mut FunctionDefinition, live_values: &HashSet<Reg
 
         for (phi_idx, phi) in block.phinodes.iter().enumerate() {
             let rid = RegisterId::arg(*bid, phi_idx);
-            if *bid == code.bid_init {
+            if *bid == code.bid_init || live_values.contains(&rid) {
                 new_phinodes.push(phi.clone());
                 phi_indices_to_keep.push(phi_idx);
             } else {
-                if live_values.contains(&rid) {
-                    new_phinodes.push(phi.clone());
-                    phi_indices_to_keep.push(phi_idx);
-                } else {
-                    changed = true;
-                }
+                changed = true;
             }
         }
 
